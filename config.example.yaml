@@ -1,0 +1,18 @@
+# Example config for submit_readings.py
+# Copy to config.yaml and fill in your values. CLI flags override config.
+
+# Required: your account / contract number (лицевой счёт)
+account: "12345678"
+
+# Tariff type: single | two-zone | three-zone
+tariff: single
+
+# Readings (can be set via CLI instead: --day, --night, --peak)
+# For single: only day. For two-zone: day + night. For three-zone: day + night + peak.
+day: ""
+night: ""
+peak: ""
+
+# Optional contact (form may require one of these)
+email: ""
+phone: ""
