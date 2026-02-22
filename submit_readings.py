@@ -92,6 +92,11 @@ def parse_args():
         action="store_true",
         help="Do not warn when run after the 25th of the month.",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print frame URLs and form-field discovery to stderr.",
+    )
     return parser.parse_args()
 
 
@@ -150,9 +155,11 @@ def _fill_form_via_js(eval_target, account, tariff, day, night, peak, email, pho
             if (acc) {
                 const container = acc.closest('form') || acc.closest('div') || root;
                 let filled = 0;
-                container.querySelectorAll('input[name], select[name]').forEach(el => {
+                container.querySelectorAll('input[name], select[name], input[id]').forEach(el => {
                     const name = el.getAttribute('name');
-                    const val = args[name] !== undefined ? String(args[name]) : null;
+                    const id = el.id || '';
+                    const val = (args[name] !== undefined ? String(args[name]) : null)
+                        || (id && args[id] !== undefined ? String(args[id]) : null);
                     if (val !== null && val !== '') {
                         el.value = val;
                         el.dispatchEvent(createEvent('input'));
@@ -181,29 +188,74 @@ def _fill_form_via_js(eval_target, account, tariff, day, night, peak, email, pho
     return eval_target.evaluate(script, args)
 
 
-def run_submit(account, tariff, day, night, peak, email, phone, headed):
+def _debug_form_fields(eval_target, label, debug):
+    """If debug, run JS to list input/select names in document (and shadow) and print to stderr."""
+    if not debug:
+        return
+    script = """
+    () => {
+        const names = [];
+        function walk(root, depth) {
+            if (!root || depth > 25) return;
+            root.querySelectorAll('input[name], select[name]').forEach(el => {
+                const n = el.getAttribute('name');
+                if (n) names.push(n);
+            });
+            root.querySelectorAll('*').forEach(el => {
+                if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
+            });
+        }
+        walk(document, 0);
+        return names;
+    }
+    """
+    try:
+        found = eval_target.evaluate(script)
+        print(f"Debug [{label}] input/select names: {found}", file=sys.stderr)
+    except Exception as e:
+        print(f"Debug [{label}] error: {e}", file=sys.stderr)
+
+
+def run_submit(account, tariff, day, night, peak, email, phone, headed, debug=False):
     """Open page, fill form, submit, check success. Returns (success: bool, message: str)."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not headed)
         try:
             page = browser.new_page()
             page.goto(URL, wait_until="networkidle", timeout=FORM_WAIT_TIMEOUT_MS)
-            # Formy widget can load in shadow DOM or in an iframe; give it time to appear
+            # Formy widget can load in shadow DOM or in an iframe; wait for it
             page.wait_for_timeout(8000)
-            result = _fill_form_via_js(
-                page, account, tariff, day, night, peak, email, phone
-            )
+            # Wait for Formy iframe to appear (up to 12s)
+            for _ in range(12):
+                formy_frames = [f for f in page.frames if f != page.main_frame and "formy" in (f.url or "")]
+                if formy_frames:
+                    break
+                page.wait_for_timeout(1000)
+            if debug:
+                print("Debug frame URLs:", [f.url for f in page.frames], file=sys.stderr)
+                _debug_form_fields(page, "main", debug)
+                for i, f in enumerate(formy_frames):
+                    _debug_form_fields(f, f"frame_formy_{i}", debug)
+            result = None
             fill_target = page
-            if result.get("filled", 0) < 2:
-                # Try inside Formy iframe (form may be embedded there)
-                for frame in page.frames:
-                    if frame != page.main_frame and "formy" in (frame.url or ""):
-                        result = _fill_form_via_js(
-                            frame, account, tariff, day, night, peak, email, phone
-                        )
-                        if result.get("filled", 0) >= 2:
-                            fill_target = frame
-                            break
+            # Try Formy iframe(s) first (form is often only there)
+            for frame in formy_frames:
+                result = _fill_form_via_js(
+                    frame, account, tariff, day, night, peak, email, phone
+                )
+                if debug:
+                    print(f"Debug fill in formy frame: filled={result.get('filled', 0)}, submitClicked={result.get('submitClicked')}", file=sys.stderr)
+                if result.get("filled", 0) >= 2:
+                    fill_target = frame
+                    break
+            if result is None or result.get("filled", 0) < 2:
+                result = _fill_form_via_js(
+                    page, account, tariff, day, night, peak, email, phone
+                )
+                if debug:
+                    print(f"Debug fill in main page: filled={result.get('filled', 0)}, submitClicked={result.get('submitClicked')}", file=sys.stderr)
+                if result.get("filled", 0) >= 2:
+                    fill_target = page
             if result.get("filled", 0) < 2:
                 return False, "Could not find form fields (form may have changed or not loaded)."
             if not result.get("submitClicked"):
@@ -264,6 +316,7 @@ def main():
             email=email,
             phone=phone,
             headed=args.headed,
+            debug=args.debug,
         )
     except PlaywrightTimeout as e:
         print(f"Error: Timeout while loading or submitting the form. Try --headed or run again. ({e})", file=sys.stderr)
